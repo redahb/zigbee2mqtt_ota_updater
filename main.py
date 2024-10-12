@@ -1,6 +1,9 @@
 import json
+import sys
+import time
+import threading
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import timedelta, datetime
 from time import sleep
 
 import paho.mqtt.client as mqtt
@@ -22,6 +25,8 @@ init_done = False
 nicer_output_flag = False
 only_once = True
 num_total = 0
+last_message_time = time.time()
+inactivity_timeout = 300
 
 
 @dataclass
@@ -34,16 +39,20 @@ class OtaDevice:
     updating: bool
 
 
-def on_connect(client, userdata, flags, rc):
-    client.subscribe("zigbee2mqtt/bridge/devices")
-    client.subscribe("zigbee2mqtt/bridge/response/device/ota_update/check")
-    client.subscribe("zigbee2mqtt/bridge/response/device/ota_update/update")
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code == 0:
+        client.subscribe("zigbee2mqtt/bridge/devices")
+        client.subscribe("zigbee2mqtt/bridge/response/device/ota_update/check")
+        client.subscribe("zigbee2mqtt/bridge/response/device/ota_update/update")
+    else:
+        print(f"Connection failed: {reason_code}")
+        sys.exit(1)
 
 
-# The callback for when a PUBLISH message is received from the server.
 def on_message(client, userdata, msg):
-    global nicer_output_flag, only_once, otadict
-    message = (msg.payload).decode("utf-8")
+    global nicer_output_flag, only_once, otadict, last_message_time
+    last_message_time = time.time()
+    message = msg.payload.decode("utf-8")
     obj = json.loads(message)
     lower_topic = msg.topic.lower()
     if lower_topic == "zigbee2mqtt/bridge/devices":
@@ -58,34 +67,44 @@ def on_message(client, userdata, msg):
     elif lower_topic == "zigbee2mqtt/bridge/response/device/ota_update/update":
         handle_otasuccess(obj)
     else:
-        if obj["update"]:
+        if "update" in obj and obj["update"]:
             device_fn = msg.topic.replace("zigbee2mqtt/", "")
             if "remaining" in obj["update"]:
                 remaining_time = timedelta(seconds=obj["update"]["remaining"])
                 percent = obj["update"]["progress"]
+                current_time = datetime.now().strftime("%H:%M:%S")
                 print(
-                    f"Updating {device_fn} - {percent:6.2f}%, {remaining_time} remaining"
+                    f"  {current_time}: Updating '{device_fn}' - {percent:6.2f}%, {remaining_time} remaining"
                 )
             elif obj["update"]["state"] == "idle":
-                r = list(
-                    filter(
-                        lambda x: x.updating and x.friendly_name == device_fn,
-                        otadict.values(),
-                    )
-                )
+                r = [
+                    device
+                    for device in otadict.values()
+                    if device.updating and device.friendly_name == device_fn
+                ]
                 if r:
                     otacleanup(r[0])
+
+
+def on_disconnect(client, userdata, reason_code, properties):
+    if reason_code != 0:
+        print("Connection lost, reconnecting")
+        try:
+            client.reconnect()
+        except Exception as e:
+            print(f"Failed to reconnect, error: {e}")
+            sys.exit(1)
 
 
 def handle_devicelist(devicelist):
     print("Looking for supported devices:")
     global otadict, num_total
     for device in devicelist:
-        if device["definition"]:
+        if device.get("definition"):
             dev = OtaDevice(
                 device["friendly_name"],
                 device["ieee_address"],
-                device["definition"]["supports_ota"],
+                device["definition"].get("supports_ota", False),
                 False,
                 False,
                 False,
@@ -93,7 +112,7 @@ def handle_devicelist(devicelist):
             otadict[dev.ieee_addr] = dev
             if dev.supports_ota:
                 print(
-                    f"  {dev.friendly_name} supports OTA Updates, checking for new updates"
+                    f"  '{dev.friendly_name}' supports OTA Updates, checking for new updates"
                 )
                 num_total += 1
                 check_for_update(dev)
@@ -102,15 +121,16 @@ def handle_devicelist(devicelist):
 def handle_otacheck(obj):
     global otadict, sent_request, init_done, num_total
     ieee = obj["data"]["id"]
-    device: OtaDevice = otadict[ieee]
+    device = otadict[ieee]
     if ieee in sent_request:
         sent_request.remove(ieee)
     progress = f"[{num_total - len(sent_request)}/{num_total}]"
     if obj["status"] == "ok":
         device.update_available = obj["data"]["updateAvailable"]
-        print(
-            f"  {progress} {device.friendly_name} has an update available: {device.update_available}"
-        )
+        if device.update_available:
+            print(f"  {progress} Update is available for '{device.friendly_name}'")
+        else:
+            print(f"  {progress} No update available for '{device.friendly_name}'")
     else:
         print(f"  {progress} {obj['error']}")
         if obj["error"].startswith("Update or check"):
@@ -125,9 +145,11 @@ def handle_otasuccess(obj):
         print(obj["error"])
     else:
         name = obj["data"]["id"]
-        res = list(
-            filter(lambda device: device.friendly_name == name, otadict.values())
-        )
+        res = [
+            device
+            for device in otadict.values()
+            if device.friendly_name == name
+        ]
         if res:
             otacleanup(res[0])
 
@@ -138,7 +160,7 @@ def otacleanup(dev: OtaDevice):
     dev.update_available = False
     currently_updating.remove(dev.ieee_addr)
     print(
-        f"Update for {dev.friendly_name} finished - {len(possible_devices)} more updates to go"
+        f"Update for '{dev.friendly_name}' finished - {len(possible_devices)} more updates to go"
     )
     client.unsubscribe(f"zigbee2mqtt/{dev.friendly_name}")
 
@@ -155,7 +177,7 @@ def check_for_update(device: OtaDevice):
 
 def start_update(device: OtaDevice):
     global currently_updating
-    print(f"Starting Update for {device.friendly_name}")
+    print(f"Starting Update for '{device.friendly_name}'")
     client.subscribe(f"zigbee2mqtt/{device.friendly_name}")
     client.publish(
         "zigbee2mqtt/bridge/request/device/ota_update/update",
@@ -165,9 +187,27 @@ def start_update(device: OtaDevice):
     currently_updating.append(device.ieee_addr)
 
 
-client = mqtt.Client()
+def monitor_inactivity():
+    global last_message_time, client
+    while True:
+        time_since_last_message = time.time() - last_message_time
+        if time_since_last_message > inactivity_timeout:
+            print(f"Received no new messages in the last {inactivity_timeout} seconds, reconnecting")
+            try:
+                client.reconnect()
+                last_message_time = time.time()
+            except Exception as e:
+                print(f"Failed to reconnect, error: {e}")
+                client.loop_stop()
+                client.disconnect()
+                sys.exit(1)
+        time.sleep(10)
+
+
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.on_connect = on_connect
 client.on_message = on_message
+client.on_disconnect = on_disconnect
 if MQTT_USE_AUTH:
     client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
 
@@ -175,15 +215,19 @@ print("Starting initialization")
 client.connect(MQTT_SERVER, MQTT_PORT, 60)
 client.loop_start()
 
+inactivity_thread = threading.Thread(target=monitor_inactivity, daemon=True)
+inactivity_thread.start()
+
 while not init_done:
-    pass
+    sleep(0.1)
+
 print("Finished initialization")
 
-possible_devices = list(
-    filter(
-        lambda device: not device.updating and device.update_available, otadict.values()
-    )
-)
+possible_devices = [
+    device
+    for device in otadict.values()
+    if not device.updating and device.update_available
+]
 
 print(f"There are updates for {len(possible_devices)} devices")
 
@@ -193,8 +237,7 @@ while possible_devices:
         start_update(device)
     sleep(5)
 
-while len(currently_updating) != 0:
+while currently_updating:
     sleep(5)
-    pass
 
 print("Finished updating")
